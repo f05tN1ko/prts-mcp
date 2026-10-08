@@ -1,0 +1,95 @@
+name: Docker hosting image
+
+# Manual-only validation of the repository-root Dockerfile used by platform
+# hosts (ModelScope MCP plaza and similar). The regular CI builds
+# python/Dockerfile and ts/Dockerfile* and does not cover the root image.
+#
+# workflow_dispatch requires this file to exist on the DEFAULT branch before
+# the "Run workflow" button appears; after that the button lets you run it
+# against any branch or tag.
+on:
+  workflow_dispatch:
+    inputs:
+      prefetch_data:
+        description: "Bake the level/story archives into the image at build time"
+        type: choice
+        options:
+          - "1"
+          - "0"
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  hosting-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build root Dockerfile
+        run: |
+          docker build \
+            --build-arg PREFETCH_DATA=${{ inputs.prefetch_data }} \
+            -t prts-mcp-hosted .
+
+      - name: Image size
+        run: docker image ls prts-mcp-hosted
+
+      - name: Verify data baked into the image
+        run: |
+          docker run --rm --entrypoint sh prts-mcp-hosted -c '
+            set -eu
+            echo "--- operator tables (committed in-tree) ---"
+            ls -l /app/data/gamedata/zh_CN/gamedata/excel
+            echo "--- story archive (build-time prefetch) ---"
+            ls -l /app/data/storyjson/zh_CN.zip || echo "MISSING story zip"
+            echo "--- level combat data (build-time prefetch) ---"
+            ls -l /app/data/gamedata-levels/zh_CN/gamedata/levels/enemydata/enemy_database.json \
+              || echo "MISSING levels"
+          '
+
+      - name: Smoke test stdio transport (the hosted default)
+        run: |
+          {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
+            sleep 8
+          } | timeout 90 docker run -i --rm prts-mcp-hosted > stdio.out 2> stdio.err || true
+          echo "--- stdout ---"
+          head -c 2000 stdio.out
+          echo
+          echo "--- stderr tail ---"
+          tail -n 30 stdio.err
+          grep -q '"serverInfo"' stdio.out
+
+      - name: Start in HTTP mode and wait for health
+        run: |
+          docker run -d --name prts \
+            -e PRTS_TRANSPORT=http -e PORT=3000 -p 3000:3000 prts-mcp-hosted
+          ok=0
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:3000/health; then ok=1; break; fi
+            sleep 2
+          done
+          echo
+          echo "--- container log ---"
+          docker logs prts 2>&1 | tail -n 40 || true
+          if [ "$ok" != "1" ]; then
+            echo "::error::/health never became ready"
+            exit 1
+          fi
+
+      - name: MCP initialize handshake (informational)
+        continue-on-error: true
+        run: |
+          curl -sS -i -X POST http://127.0.0.1:3000/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}' \
+            | head -n 40
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs prts 2>&1 | tail -n 100 || true
