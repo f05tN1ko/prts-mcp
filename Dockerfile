@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 #
 # Hosting image for the ModelScope MCP 广场 ("可托管部署") / generic PaaS builders.
 #
